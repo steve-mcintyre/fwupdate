@@ -9,6 +9,14 @@ include $(TOP)/Make.defaults
 include $(TOP)/Make.rules
 VPATH	= $(TOP)/efi
 
+# arm and aarch64 need a locally-patched crt* to work with the extra
+# SBAT section
+ifeq ($(ARCH), $(filter $(ARCH),arm aarch64))
+	CRT = $(TOP)/efi/crt0-efi-$(ARCH).o
+else
+	CRT = $(GNUEFIDIR)/crt0-efi-$(ARCH).o
+endif
+
 CFLAGS	?= -Og -g3 -Werror=format-security -Wp,-D_FORTIFY_SOURCE=2 \
 	   -fstack-protector-strong --param=ssp-buffer-size=4 \
 	   -grecord-gcc-switches
@@ -22,7 +30,7 @@ CCLDFLAGS	?= -nostdlib -Wl,--warn-common \
 	-Wl,--no-undefined -Wl,--fatal-warnings \
 	-Wl,-shared -Wl,-Bsymbolic -L$(LIBDIR) -L$(GNUEFIDIR) \
 	-Wl,--build-id=sha1 -Wl,--hash-style=sysv \
-	$(GNUEFIDIR)/crt0-efi-$(ARCH).o
+	$(CRT)
 CLANG_BUGS	= $(if $(findstring gcc,$(CC)),-maccumulate-outgoing-args,)
 ifeq ($(ARCH),arm)
 LIBGCC=$(shell $(CC) -print-libgcc-file-name | sed 's/\.a$$/_eh.a/')
@@ -38,6 +46,23 @@ define objcopy_version =
 	    s/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/;'
 endef
 OBJCOPY_GTE224 := $(shell expr `$(objcopy_version)` \>= 2.24)
+
+SBATPATH = data/sbat.csv
+$(SBATPATH): $(SBATPATH).in
+	@sed -e "s,@@VERSION@@,$(VERSION),g" $< > $@
+
+sbat.%.csv : data/sbat.%.csv
+	$(DOS2UNIX) $(D2UFLAGS) $< $@
+	tail -c1 $@ | read -r _ || echo >> $@ # ensure a trailing newline
+
+VENDOR_SBATS := $(foreach x,$(wildcard data/sbat.*.csv),$(notdir $(x)))
+
+sbat_data.o : | $(SBATPATH) $(VENDOR_SBATS)
+sbat_data.o : /dev/null
+	$(CC) $(BUILDFLAGS) -x c -c -o $@ $<
+	$(OBJCOPY) --add-section .sbat=$(SBATPATH) \
+	--set-section-flags .sbat=contents,alloc,load,readonly,data $@
+	$(foreach vs,$(VENDOR_SBATS),$(call add-vendor-sbat,$(vs),$@))
 
 FWUP = fwupdate
 
@@ -94,15 +119,15 @@ ifneq ($(OBJCOPY_GTE224),1)
 	$(error objcopy >= 2.24 is required)
 endif
 	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-		-j .rel* -j .rela* -j .reloc -j .eh_frame \
-		$(FORMAT) $^ $@
+		-j .rel* -j .rela* -j .reloc -j .eh_frame -j .sbat \
+		$(FORMAT) $< $@
 
 %.efi.debug : %.so
 ifneq ($(OBJCOPY_GTE224),1)
 	$(error objcopy >= 2.24 is required)
 endif
 	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-		-j .rel* -j .rela* -j .reloc -j .eh_frame \
+		-j .rel* -j .rela* -j .reloc -j .eh_frame -j .sbat \
 		-j .debug* -j .note.gnu.build-id \
 		$^ $@
 
@@ -110,7 +135,7 @@ endif
 	$(READELF) -n $^ | grep "Build ID:" | \
 		sed -e 's/^.*Build ID: //' -e 's,^\(..\),\1/,' > $@
 
-%.so : %.o
+%.so : %.o sbat_data.o
 	$(CC) $(CCLDFLAGS) -o $@ $^ -lefi -lgnuefi \
 		$(LIBGCC) \
 		-T elf_$(ARCH)_efi.lds
@@ -120,7 +145,7 @@ endif
 
 clean :
 	@rm -vf $(TARGETS) *.o *.so *.efi.signed *.efi *.efi.debug \
-		*.efi.build-id
+		*.efi.build-id $(SBATPATH)
 
 buildiddir = $(dir $(shell cat $(1).build-id))
 buildidname = $(notdir $(shell cat $(1).build-id))
@@ -140,3 +165,9 @@ install : $(FWUP).efi | $(FWUP).efi.debug $(FWUP).efi.build-id
 	$(foreach prog,$^,$(call inst,$(prog)) ; )
 	$(INSTALL) -d -m 755 $(DESTDIR)$(DEBUGSOURCE)/fwupdate-$(VERSION)$(DASHRELEASE)$(DOTARCH)/efi/
 	$(foreach src,$(wildcard *.[chS]),$(INSTALL) -m 644 $(src) $(DESTDIR)$(DEBUGSOURCE)/fwupdate-$(VERSION)$(DASHRELEASE)$(DOTARCH)/efi/$(src) ;)
+
+$(TOP)/efi/crt0-efi-$(ARCH).o:	$(TOP)/efi/crt0-efi-$(ARCH).S
+	$(CC) $(BUILDFLAGS) -c -o $@ $^
+
+$(TARGETS): $(CRT)
+

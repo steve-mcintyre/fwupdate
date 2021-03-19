@@ -39,6 +39,17 @@ SECTIONS
   }
   .note.gnu.build-id : { *(.note.gnu.build-id) }
 
+  . = ALIGN(4096);
+  .sbat :
+  {
+    _sbat = .;
+    *(.sbat)
+    *(.sbat.*)
+    _esbat = .;
+  }
+  _sbat_size = . - _sbat;
+  _alldata_size = . - _data;
+
   .rela.dyn : { *(.rela.dyn) }
   .rela.plt : { *(.rela.plt) }
   .rela.got : { *(.rela.got) }
